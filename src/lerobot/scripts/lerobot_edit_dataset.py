@@ -66,6 +66,14 @@ Remove camera feature:
         --operation.type remove_feature \
         --operation.feature_names "['observation.images.top']"
 
+Clip action feature:
+    python -m lerobot.scripts.lerobot_edit_dataset \
+        --repo_id lerobot/pusht \
+        --operation.type clip_values \
+        --operation.feature_names "['observation.images.top']"
+        --operation.max_threshold 100000000 \
+        --operation.max_value 0
+
 Convert image dataset to video format (saves locally):
     python -m lerobot.scripts.lerobot_edit_dataset \
         --repo_id lerobot/pusht_image \
@@ -101,6 +109,7 @@ from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
+    clip_dataset_values,
     delete_episodes,
     merge_datasets,
     remove_feature,
@@ -138,6 +147,16 @@ class RemoveFeatureConfig:
 
 
 @dataclass
+class ClipValuesConfig:
+    type: str = "clip_values"
+    feature_names: list[str] | None = None
+    min_threshold: float | None = None
+    max_threshold: float | None = None
+    min_value: float | None = None
+    max_value: float | None = None
+
+
+@dataclass
 class ConvertToVideoConfig:
     type: str = "convert_to_video"
     output_dir: str | None = None
@@ -153,7 +172,14 @@ class ConvertToVideoConfig:
 @dataclass
 class EditDatasetConfig:
     repo_id: str
-    operation: DeleteEpisodesConfig | SplitConfig | MergeConfig | RemoveFeatureConfig | ConvertToVideoConfig
+    operation: (
+        DeleteEpisodesConfig
+        | SplitConfig
+        | MergeConfig
+        | ClipValuesConfig
+        | RemoveFeatureConfig
+        | ConvertToVideoConfig
+    )
     root: str | None = None
     new_repo_id: str | None = None
     push_to_hub: bool = False
@@ -285,6 +311,53 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
     new_dataset = remove_feature(
         dataset,
         feature_names=cfg.operation.feature_names,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Remaining features: {list(new_dataset.meta.features.keys())}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_clip_values(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ClipValuesConfig):
+        raise ValueError("Operation config must be ClipValuesConfig")
+
+    if not cfg.operation.feature_names:
+        raise ValueError("feature_names must be specified for clip_values operation")
+
+    if cfg.operation.min_threshold is None and cfg.operation.max_threshold is None:
+        raise ValueError("At least one of min_threshold or max_threshold must be specified")
+
+    if cfg.operation.min_threshold is not None and cfg.operation.min_value is None:
+        raise ValueError("min_value must be specified when min_threshold is provided")
+    if cfg.operation.max_threshold is not None and cfg.operation.max_value is None:
+        raise ValueError("max_value must be specified when max_threshold is provided")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(f"Clipping features {cfg.operation.feature_names} from {cfg.repo_id}")
+    new_dataset = clip_dataset_values(
+        dataset,
+        feature_names=cfg.operation.feature_names,
+        thresholds={
+            "min": cfg.operation.min_threshold,
+            "max": cfg.operation.max_threshold,
+        },
+        values={
+            "min": cfg.operation.min_value,
+            "max": cfg.operation.max_value,
+        },
         output_dir=output_dir,
         repo_id=output_repo_id,
     )
@@ -718,6 +791,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "clip_values":
+        handle_clip_values(cfg)
     elif operation_type == "convert_to_video":
         handle_convert_to_video(cfg)
     else:

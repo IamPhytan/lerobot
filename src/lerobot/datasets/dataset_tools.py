@@ -51,7 +51,7 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STATE
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -438,6 +438,125 @@ def remove_feature(
         output_dir=output_dir,
         repo_id=repo_id,
     )
+
+
+def clip_value(
+    value: np.ndarray, idxs: list[int], thresholds: dict[str, float], values: dict[str, float]
+) -> np.ndarray:
+    value = value.copy()
+
+    # Clip value features
+    if thresholds.get("min") is not None:
+        value[idxs] = np.where(value[idxs] < thresholds.get("min"), values.get("min"), value[idxs])
+    if thresholds.get("max") is not None:
+        value[idxs] = np.where(value[idxs] > thresholds.get("max"), values.get("max"), value[idxs])
+    return value
+
+
+def clip_dataset_values(
+    src_dataset: LeRobotDataset,
+    feature_names: str | list[str],
+    thresholds: dict[str, float | None],
+    values: dict[str, float | None],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Clip features from a LeRobotDataset.
+
+    Args:
+        dataset: The source LeRobotDataset.
+        feature_names: Name(s) of features to clip. Can be a single string or list.
+        output_dir: Directory to save the new dataset. If None, uses default location.
+        repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+
+    Returns:
+        New dataset with clipped features.
+    """
+
+    clip_features_list: list[str] = []
+    clip_features_list = [feature_names] if isinstance(feature_names, str) else feature_names
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    features = {}
+    for feature_name in clip_features_list:
+        if feature_name.startswith(OBS_STATE):
+            features.setdefault(OBS_STATE, []).append(feature_name.removeprefix(f"{OBS_STATE}."))
+        if feature_name.startswith(ACTION):
+            features.setdefault(ACTION, []).append(feature_name.removeprefix(f"{ACTION}."))
+
+    if not features:
+        return src_dataset
+
+    if repo_id is None:
+        repo_id = f"{src_dataset.repo_id}_clipped"
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=src_dataset.meta.fps,
+        features=src_dataset.meta.features,
+        robot_type=src_dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(src_dataset.meta.video_keys) > 0,
+    )
+
+    episode_indices = [*range(src_dataset.meta.total_episodes)]
+    episode_mapping = {i: i for i in episode_indices}
+
+    video_metadata = None
+    if src_dataset.meta.video_keys:
+        video_metadata = _copy_and_reindex_videos(src_dataset, new_meta, episode_mapping)
+
+    data_metadata = _copy_and_reindex_data(src_dataset, new_meta, episode_mapping)
+
+    _copy_and_reindex_episodes_metadata(src_dataset, new_meta, episode_mapping, data_metadata, video_metadata)
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=src_dataset.image_transforms,
+        delta_timestamps=src_dataset.delta_timestamps,
+        tolerance_s=src_dataset.tolerance_s,
+    )
+
+    metadata_names = new_dataset.meta.names
+
+    features_idxs = {
+        ACTION: [metadata_names[ACTION].index(name) for name in features[ACTION]],
+        OBS_STATE: [metadata_names[OBS_STATE].index(name) for name in features[OBS_STATE]],
+    }
+
+    for ep_idx in episode_indices:
+        ep_path = new_dataset.meta.get_data_file_path(ep_idx)
+        df: pd.DataFrame = pd.read_parquet(new_dataset.root / ep_path)
+
+        # Clip action features
+        if ACTION in features:
+            df[ACTION] = df[ACTION].apply(
+                clip_value,
+                args=(
+                    features_idxs[ACTION],
+                    thresholds,
+                    values,
+                ),
+            )
+        # Clip state features
+        if OBS_STATE in features:
+            df[OBS_STATE] = df[OBS_STATE].apply(
+                clip_value,
+                args=(
+                    features_idxs[OBS_STATE],
+                    thresholds,
+                    values,
+                ),
+            )
+
+        # Write using the same chunk/file structure as source
+        dst_path = new_dataset.root / ep_path
+        _write_parquet(df, dst_path, new_meta)
+
+    return new_dataset
 
 
 def _fractions_to_episode_indices(
