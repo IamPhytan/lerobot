@@ -556,6 +556,9 @@ def clip_dataset_values(
         dst_path = new_dataset.root / ep_path
         _write_parquet(df, dst_path, new_meta)
 
+    # TODO(IamPhytan): Recompute stats after copying files
+    # Probably need a method to recompute stats
+
     return new_dataset
 
 
